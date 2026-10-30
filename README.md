@@ -48,7 +48,7 @@ Only element's `x`, `y`, `width`, `height`, and `font_size` change. Canvas dimen
 
 ### Quick start:
 
-In Chameleon main directory, run
+In Chameleon main directory, install required packages in ``requirements.txt`` and run:
 
 `python -m engine.main`
 
