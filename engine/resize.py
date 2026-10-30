@@ -8,6 +8,7 @@ the Dockerfile) is plumbing so you can focus on exactly one function:
 
 from typing import Any
 from . import arrangement as A
+from .groupformation import build_containment_groups
 import json
 
 
@@ -53,7 +54,8 @@ def resize(source: dict[str, Any], target_canvas: dict[str, Any]) -> dict[str, A
     # schema-correct output on day one. Replace the body of this function;
     # do not just tune these three lines.
     # ------------------------------------------------------------------
-    res = A.arrange(source, target_canvas)
+    groups = build_containment_groups(source) # identify relationships between elements in the original design
+    res = A.arrange(source, groups, target_canvas) # arrange the list of groups onto the new target canvas using ranking/scoring Engine
     return res
 
     # scale_x = target_canvas["width"] / source["canvas"]["width"]

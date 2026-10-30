@@ -1,9 +1,8 @@
-"""Deterministic, importance-aware CHAMELEON retargeting (Python 3.10+).
+"""
+Deterministic, importance-aware arrangement.
 
-Only x, y, width, height and an existing text font_size are edited. A learned
-ranker's predict(rows) method can replace the documented heuristic importance.
+Only x, y, width, height and an existing text font_size are edited.
 No model is trained, downloaded, or silently substituted for human supervision.
-See README.md for geometry, text-measurement and feasibility limits.
 """
 from __future__ import annotations
 
@@ -21,16 +20,8 @@ from .groupformation import Group, Similarity, _bucket_similar, _corners
 LOG = logging.getLogger(__name__)
 EPS = 1e-7
 EDITABLE = frozenset({"x", "y", "width", "height"})
-FEATURE_NAMES = ("role", "text_prominence", "contrast", "sqrt_area",
+FEATURE_NAMES = ("text_prominence", "contrast", "sqrt_area",
                  "centrality", "visibility", "contrast_available")
-ROLE_PRIORS = {"cta": 1., "headline": .95, "product": .9, "logo": .9,
-               "body": .65, "image": .6, "shape": .3,
-               "decoration": .15, "background": .1}
-
-
-class Ranker(Protocol):
-    def predict(self, rows: Sequence[Sequence[float]]) -> Sequence[float]: ...
-
 
 class TextMeasurer(Protocol):
     """Return unwrapped text width in pixels, including style_runs/spacing.
@@ -69,19 +60,12 @@ class ConservativeTextMeasurer:
 
 @dataclass
 class Config:
-    min_font_size: float = 12.
+    min_font_size: float = 12. # minimum font size that ensures readability of the design
     margin_ratio: float = .025
     gap_ratio: float = .025
-    max_candidates: int = 72
-    max_elements: int = 250
-    max_depth: int = 64
+    max_candidates: int = 72 # number of different predicted layout candidates
+    max_depth: int = 64 # max z-index of the design (used as termination condition)
     max_font_scale: float = 2.
-    strict_readability: bool = False
-    # Override by element/group ID: container, composite, rigid.
-    behaviors: dict[str, str] = field(default_factory=dict)
-    role_priors: dict[str, float] = field(default_factory=lambda: dict(ROLE_PRIORS))
-    # All foreground image rectangles retain source aspect ratio. Full-canvas
-    # cover backgrounds may change box ratio; their unchanged fit handles pixels.
     preserve_image_aspect: bool = True
 
 
@@ -194,99 +178,6 @@ def intersection_area(a, b):
                 poly.append((u[0]+t*(v[0]-u[0]), u[1]+t*(v[1]-u[1])))
     return polygon_area(poly)
 
-
-def validate_source(source, config):
-    if not isinstance(source, dict) or not isinstance(source.get("canvas"), dict):
-        raise ValueError("source must contain canvas and elements")
-    for name in ("width", "height"):
-        v = source["canvas"][name]
-        finite(v, f"canvas.{name}", 1)
-        if not isinstance(v, int) or isinstance(v, bool):
-            raise ValueError("Canvas dimensions must be positive integers")
-    elements = source.get("elements")
-    if not isinstance(elements, list) or len(elements) > config.max_elements:
-        raise ValueError(f"elements must be a list of at most {config.max_elements} items")
-    seen = set()
-    for e in elements:
-        eid = e.get("id")
-        if not isinstance(eid, str) or eid in seen:
-            raise ValueError(f"Invalid or duplicate element ID: {eid!r}")
-        seen.add(eid)
-        if e.get("type") not in ("text", "image", "shape"):
-            raise ValueError(f"{eid}: unsupported type")
-        for name in ("x", "y", "width", "height"):
-            finite(e[name], f"{eid}.{name}", 0 if name in ("width", "height") else None)
-        finite(e.get("rotation", 0), f"{eid}.rotation")
-        if isinstance(e.get("z_index", 0), bool) or not isinstance(e.get("z_index", 0), int):
-            raise ValueError(f"{eid}.z_index must be an integer")
-        opacity = finite(e.get("opacity", 1), f"{eid}.opacity", 0)
-        if opacity > 1:
-            raise ValueError(f"{eid}.opacity must be <= 1")
-        if e["type"] == "text":
-            finite(e["font_size"], f"{eid}.font_size", 1)
-            finite(e.get("line_height", 1.2), f"{eid}.line_height", EPS)
-            finite(e.get("letter_spacing", 0), f"{eid}.letter_spacing")
-            if not isinstance(e.get("content"), str):
-                raise ValueError(f"{eid}.content must be a string")
-            cap = e.get("max_lines")
-            if cap is not None and (isinstance(cap, bool) or not isinstance(cap, int) or cap < 1):
-                raise ValueError(f"{eid}.max_lines must be a positive integer or null")
-
-
-def build_containment_groups(source: dict[str, Any], *,
-                             detect_similarity=True) -> list[Group]:
-    """The existing DFS rule, with FULL rotated containment instead of overlap.
-
-    Uses the original Group/Similarity classes. It does not mutate an existing
-    tree. Explicit group_id is preserved, and checked by the arrangement stage.
-    Out-of-canvas source elements are permitted as canvas-level children.
-    """
-    validate_source(source, Config())
-    canvas = source["canvas"]
-    w, h = canvas["width"], canvas["height"]
-    root = Group(None, None, (w,h), (w/2,h/2), (w/2,h/2))
-    ordered = sorted(enumerate(deepcopy(source["elements"])),
-                     key=lambda pair: pair[1].get("z_index", 0))
-    # Reserve explicit containment links before DFS. Otherwise a label inside
-    # the canvas could be claimed before its slightly off-canvas rotated panel.
-    preferred_parent = {}
-    for ci,child in ordered:
-        gid = child.get("group_id")
-        if gid is None: continue
-        possible = [(pi,p) for pi,p in ordered if p["id"] != child["id"]
-                    and p.get("group_id") == gid and p["type"] != "text"
-                    and (p.get("z_index",0),pi) < (child.get("z_index",0),ci)
-                    and contains(p,child)]
-        if possible:
-            preferred_parent[child["id"]] = min(possible,key=lambda pair:
-                (pair[1]["width"]*pair[1]["height"],pair[0]))[1]["id"]
-    assigned = set()
-    def populate(parent, depth=0):
-        if depth > 64:
-            raise ValueError("Hierarchy exceeds 64 levels")
-        children = []
-        px, py, _, _ = parent.source_bbox
-        for index, e in ordered:
-            if e["id"] in assigned:
-                continue
-            if e["id"] in preferred_parent and preferred_parent[e["id"]] != parent.id:
-                continue
-            if parent.element is not None and (
-                (e.get("z_index",0) <= parent.z_index and
-                 preferred_parent.get(e["id"]) != parent.id) or not contains(parent.element,e)
-            ):
-                continue
-            r = region(e)
-            child = Group(e["id"], e.get("z_index",0), (r.width,r.height),
-                          (r.cx-px,r.cy-py), (r.cx,r.cy), parent, e, index)
-            assigned.add(child.id)
-            children.append(child)
-            populate(child, depth+1)
-        parent.members = _bucket_similar(children, detect_similarity, 2., .05)
-    populate(root)
-    return root.children
-
-
 def prepare_tree(source, groups, config):
     """Accept roots OR a flat collection including descendants; reject ambiguity."""
     src = {e["id"]: e for e in source["elements"]}
@@ -342,9 +233,7 @@ def prepare_tree(source, groups, config):
         gids = {src[c.id].get("group_id") for c in g.children}
         composite = bool(g.children) and (e["type"] == "shape" or
                      (e.get("group_id") is not None and gids == {e["group_id"]}))
-        behavior = config.behaviors.get(eid, "composite" if composite else "container")
-        if behavior not in ("container", "composite", "rigid"):
-            raise ValueError(f"Unknown behavior {behavior!r} for {eid}")
+        behavior = "composite" if composite else "container"
         nodes[eid] = Node(g,e,parent_id,children,bg,decor,behavior)
     # The canvas's Similarity buckets also matter, even when roots were supplied.
     parents = {id(g.parent):g.parent for g in roots if g.parent is not None}
@@ -383,8 +272,7 @@ def prepare_tree(source, groups, config):
 
 
 def aspect_locked(node, config):
-    return node.behavior == "rigid" or (config.preserve_image_aspect and
-           node.element["type"] == "image" and not node.background)
+    return (config.preserve_image_aspect and node.element["type"] == "image" and not node.background)
 
 
 def rgba(value):
@@ -405,64 +293,99 @@ def luminance(color):
     return sum(v*w for v,w in zip(rgb,(.2126,.7152,.0722)))
 
 
-def extract_importance(source,nodes,config,ranker=None):
-    w,h = source["canvas"]["width"],source["canvas"]["height"]
-    max_font = max([e.get("font_size",0) for e in source["elements"]]+[1])
+def extract_importance(source, nodes, config):
+    w = source["canvas"]["width"]
+    h = source["canvas"]["height"]
+    max_font = max([e.get("font_size", 0) for e in source["elements"]] + [1])
     features, evidence = {}, {}
-    for eid,n in nodes.items():
-        e = n.element
-        hint = " ".join(str(e.get(k,"")) for k in ("role","id","asset_id","group_id")).lower()
-        if n.background: role = "background"
-        elif n.decoration: role = "decoration"
-        elif re.search(r"cta|button",hint): role = "cta"
-        elif "logo" in hint: role = "logo"
-        elif re.search(r"headline|title",hint): role = "headline"
-        elif re.search(r"product|hero",hint): role = "product"
-        elif e["type"] == "text": role = "body"
-        else: role = e["type"]
+    for eid, node in nodes.items():
+        element = node.element
+        # Use contrast only when both colors are known and fully opaque.
         contrast = None
-        foreground = rgba(e.get("color"))
-        parent = nodes.get(n.parent)
-        background = rgba(parent.element.get("fill_color")) if parent else None
-        if (foreground and background and foreground[3] == background[3] == 1
-            and parent.element.get("opacity",1) == e.get("opacity",1) == 1):
-            a,b = luminance(foreground),luminance(background)
-            contrast = math.log((max(a,b)+.05)/(min(a,b)+.05))/math.log(21)
-        cx,cy = (e["x"]+e["width"]/2)/w,(e["y"]+e["height"]/2)/h
-        centrality = max(0.,1-min(1.,math.hypot(cx-.5,cy-.5)/math.sqrt(.5)))
-        row = [config.role_priors[role], e.get("font_size",0)/max_font,
-               contrast or 0., math.sqrt(min(1.,e["width"]*e["height"]/(w*h))),
-               centrality,1.,float(contrast is not None)]
-        features[eid] = [max(0.,min(1.,float(v))) for v in row]
-        evidence[eid] = {"role":role,"role_is_heuristic":True,
-                         "contrast_missing":contrast is None,"visibility_missing":True}
+        foreground = rgba(element.get("color"))
+        parent = nodes.get(node.parent)
+        background = (
+            rgba(parent.element.get("fill_color"))
+            if parent is not None
+            else None
+        )
+        if (
+            foreground is not None
+            and background is not None
+            and foreground[3] == 1
+            and background[3] == 1
+            and parent.element.get("opacity", 1) == 1
+            and element.get("opacity", 1) == 1
+        ):
+            foreground_luminance = luminance(foreground)
+            background_luminance = luminance(background)
+
+            contrast_ratio = (max(foreground_luminance, background_luminance) + 0.05) / (min(foreground_luminance, background_luminance) + 0.05)
+            contrast = math.log(contrast_ratio) / math.log(21)
+        cx = (element["x"] + element["width"] / 2) / w
+        cy = (element["y"] + element["height"] / 2) / h
+        centrality = max(0.0,1.0 - min(1.0,math.hypot(cx - 0.5, cy - 0.5) / math.sqrt(0.5)))
+        text_prominence = (
+            element.get("font_size", 0) / max_font
+            if element["type"] == "text"
+            else 0.0
+        )
+        relative_area = min(1.0, element["width"] * element["height"] / (w * h))
+
+        row = [
+            text_prominence,
+            contrast if contrast is not None else 0.0,
+            math.sqrt(relative_area),
+            centrality,
+            1.0,  # Neutral placeholder; actual visibility is unknown.
+            float(contrast is not None),
+        ]
+        features[eid] = [
+            max(0.0, min(1.0, float(value)))
+            for value in row
+        ]
+        evidence[eid] = {
+            "contrast_missing": contrast is None,
+            "visibility_missing": True,
+        }
+
+    # Deterministic scoring
     scores = {}
-    for eid,row in features.items():
-        # Unknown asset alpha/occlusion: visibility=1 is logged, not false evidence.
-        weights = [.30,.20,.20 if row[6] else 0.,.15,.10,0.]
-        scores[eid] = sum(v*w for v,w in zip(row,weights))/sum(weights)
-    if ranker is not None:
-        ids = list(nodes)
-        raw = list(ranker.predict([features[eid] for eid in ids]))
-        if len(raw) != len(ids):
-            raise ValueError("Ranker must return exactly one finite score per Group")
-        raw = {eid:finite(float(value),"ranker prediction") for eid,value in zip(ids,raw)}
-        # Ranking margins are not probabilities. Explicit query-local min/max
-        # normalization maps them to bounded sibling allocation weights.
-        queries = {}
-        for eid,n in nodes.items(): queries.setdefault(n.parent,[]).append(eid)
-        for ids in queries.values():
-            lo,hi = min(raw[e] for e in ids),max(raw[e] for e in ids)
-            for eid in ids: scores[eid] = (raw[eid]-lo)/(hi-lo) if hi-lo>EPS else .5
-    # Propagate max descendant score without summing or rewarding large groups.
+    for eid, row in features.items():
+        contrast_available = bool(row[5])
+        weights = [
+            0.20,                                  # Text prominence
+            0.20 if contrast_available else 0.0,   # Contrast
+            0.15,                                  # Square root of area
+            0.10,                                  # Centrality
+            0.0,                                   # Unknown visibility
+            0.0,                                   # Availability flag
+        ]
+        # Renormalize over available evidence.
+        scores[eid] = sum(
+            value * weight
+            for value, weight in zip(row, weights)
+        ) / sum(weights)
+    # Propagate maximum descendant importance to each parent.
     def aggregate(eid):
-        child_scores = [aggregate(c) for b in nodes[eid].buckets for c in b]
-        scores[eid] = max([scores[eid]]+child_scores)
+        child_scores = [
+            aggregate(child_id)
+            for bucket in nodes[eid].buckets
+            for child_id in bucket
+        ]
+        scores[eid] = max([scores[eid]] + child_scores)
         return scores[eid]
-    for eid,n in nodes.items():
-        if n.parent is None: aggregate(eid)
-    return scores, {eid:{"features":dict(zip(FEATURE_NAMES,features[eid])),
-                        "score":scores[eid],**evidence[eid]} for eid in nodes}
+    for eid, node in nodes.items():
+        if node.parent is None:
+            aggregate(eid)
+    return scores, {
+        eid: {
+            "features": dict(zip(FEATURE_NAMES, features[eid])),
+            "score": scores[eid],
+            **evidence[eid],
+        }
+        for eid in nodes
+    }
 
 
 def text_layout(e, width, font, measure):
@@ -568,8 +491,6 @@ class Engine:
         self.output[eid] = out
         if not n.buckets or defer_children:
             return
-        if n.behavior == "rigid":
-            self.rigid_children(eid,out,plan)
         else:
             r = region(out)
             if n.behavior == "composite":
@@ -577,25 +498,6 @@ class Engine:
                 pad = min(r.width,r.height)*.04
                 r = r.sub(pad,pad,max(EPS,r.width-2*pad),max(EPS,r.height-2*pad))
             self.layout(n.buckets,r,plan)
-
-    def rigid_children(self,eid,out,plan):
-        old = self.nodes[eid].element
-        scale = out["width"]/max(EPS,old["width"])
-        # Uniform global transform preserves each original rotation and offset.
-        def transform(cid):
-            e = self.nodes[cid].element
-            new = deepcopy(e)
-            new.update(x=out["x"]+(e["x"]-old["x"])*scale,
-                       y=out["y"]+(e["y"]-old["y"])*scale,
-                       width=max(EPS,e["width"]*scale),height=max(EPS,e["height"]*scale))
-            if e["type"] == "text":
-                new["font_size"] = fit_font(e,new["width"],new["height"],
-                                             e["font_size"]*scale,self.measure)
-            self.output[cid] = new
-            for b in self.nodes[cid].buckets:
-                for c in b: transform(c)
-        for b in self.nodes[eid].buckets:
-            for c in b: transform(c)
 
     def slots(self,region_,count,mode,weights,alignment):
         if not count: return []
@@ -863,13 +765,13 @@ def evaluate(source,design,nodes,buckets,scores,config,measure):
 
 
 def arrange_with_report(source: dict[str,Any], groups: list[Group],
-                        target_canvas: dict[str,Any], *, ranker: Ranker | None = None,
+                        target_canvas: dict[str,Any], *,
                         config: Config | None = None,
                         text_measurer: TextMeasurer | None = None) -> ArrangementResult:
     """Search a bounded set of layouts; return design and separate diagnostics.
 
-    Strict geometry/identity/Similarity constraints are never relaxed. Without
-    strict_readability, a geometry-valid best effort may have small/overflowing
+    Strict geometry/identity/Similarity constraints are never relaxed. 
+    A geometry-valid best effort may have small/overflowing
     text; report.feasible is then false and a warning is logged. This API makes
     no claim to a global optimum, human preference, or measured contrast when
     fonts/assets/rendering are unavailable.
@@ -881,7 +783,6 @@ def arrange_with_report(source: dict[str,Any], groups: list[Group],
     for name in ("margin_ratio","gap_ratio"):
         if not 0<=finite(getattr(config,name),name)<.25: raise ValueError(f"Invalid {name}")
     if config.max_candidates<1: raise ValueError("max_candidates must be positive")
-    validate_source(source,config)
     target = {}
     for k in ("width","height"):
         v = target_canvas[k]
@@ -889,7 +790,7 @@ def arrange_with_report(source: dict[str,Any], groups: list[Group],
             raise ValueError("target_canvas width/height must be positive integers")
         target[k] = v
     nodes,buckets = prepare_tree(source,groups,config)
-    scores,features = extract_importance(source,nodes,config,ranker)
+    scores,features = extract_importance(source,nodes,config)
     engine = Engine(source,nodes,buckets,target,scores,config,measure)
     candidates,summary = [],[]
     def consider(name,d,eligible=True):
@@ -919,18 +820,15 @@ def arrange_with_report(source: dict[str,Any], groups: list[Group],
     if not metrics["feasible"]:
         warnings.append("No selected fully readable, collision-free result; returning the best geometry-valid candidate.")
     report = {"selected_candidate":name,**metrics,"candidate_count":len(summary),
-              "scorer":"provided_ranker" if ranker is not None else "deterministic_heuristic",
+              "scorer":"deterministic_heuristic",
               "text_measurement":"renderer_supplied" if getattr(measure,"exact",False) else "approximate",
               "warnings":warnings,"group_importance":features,"candidates":summary}
     result = ArrangementResult(design,report)
-    if config.strict_readability and not metrics["feasible"]:
-        raise LayoutInfeasibleError("No candidate meets minimum font, text fit and overlap requirements",result)
     if not metrics["feasible"]: LOG.warning(warnings[-1])
     return result
 
 
-def arrange(source: dict[str,Any],
+def arrange(source: dict[str,Any], groups: list[Group],
             target_canvas: dict[str,Any], **kwargs) -> dict[str,Any]:
     """Return {canvas, elements}; diagnostics never enter the design JSON."""
-    groups =  build_containment_groups(source)
     return arrange_with_report(source,groups,target_canvas,**kwargs).design

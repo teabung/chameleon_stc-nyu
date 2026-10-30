@@ -1,28 +1,21 @@
-"""Recursive grouping of a CHAMELEON v0.9 source design (Python 3.10+).
-
-Usage:
-    groups = build_groups(source)       # list[Group], canvas's direct children
-    print(json.dumps(groups_to_dict(groups), indent=2))
-
-Command line (accepts either a source design or a task containing "source"):
-    python recursive_groups.py input.json
-    python recursive_groups.py input.json --no-similarity
+"""
+Recursive grouping of a source design.
 
 Algorithm:
   * Visit elements by increasing z_index, preserving input order for ties.
   * An unassigned element may be a child only if its z_index is strictly
-    greater than its parent's and their rectangular footprints overlap.
+    greater than its parent's and their rotated rectangular bound is contained by the parent.
   * Claim the child BEFORE recursing. The first eligible depth-first parent
     wins. Finish its descendants before considering the next sibling.
   * After recursion, bucket similar siblings by alignment AND size. Every
     child appears in exactly one Similarity instance, including singletons.
 
 Conventions and limits:
-  * The synthetic canvas root has id=None and z_index=None; it accepts all
+  * The canvas root has id=None and z_index=None; it accepts all
     remaining elements, including negative layers and off-canvas elements.
-  * Missing z_index means 0 (a local convention; the schema has no default).
-  * position is the element's CENTER relative to its parent's original
-    top-left, in canvas-axis pixels. Parent rotation is not applied to axes.
+  * Missing z_index means 0.
+  * position is the element's center relative to its parent's original
+    top-left, in canvas-axis pixels.
   * size is the original element size, not a union of descendant bounds.
   * Overlap uses rotated rectangular boxes, not image alpha or shape pixels.
     Edge contact and zero-area boxes do not count as positive-area overlap.
@@ -39,7 +32,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass, field
-import json
+import math
 from math import cos, isfinite, radians, sin
 from typing import Any, Iterator
 
@@ -102,19 +95,22 @@ class Group:
             ],
         }
 
+@dataclass(frozen=True)
+class Region:
+    cx: float
+    cy: float
+    width: float
+    height: float
+    angle: float = 0.
+
+    def sub(self, x, y, width, height):
+        dx, dy = rotate(x + width/2 - self.width/2,
+                        y + height/2 - self.height/2, self.angle)
+        return Region(self.cx+dx, self.cy+dy, width, height, self.angle)
+
 
 def groups_to_dict(groups: list[Group]) -> list[dict[str, Any]]:
     return [group.to_dict() for group in groups]
-
-
-def _number(value: Any, name: str, minimum: float | None = None) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError(f"{name} must be a finite number")
-    result = float(value)
-    if not isfinite(result) or (minimum is not None and result < minimum):
-        raise ValueError(f"{name} must be finite and >= {minimum}")
-    return result
-
 
 def _corners(element: dict[str, Any]) -> list[tuple[float, float]]:
     """Clockwise rotation about center in screen coordinates (positive y down)."""
@@ -130,26 +126,6 @@ def _corners(element: dict[str, Any]) -> list[tuple[float, float]]:
             (width / 2, height / 2), (-width / 2, height / 2),
         )
     ]
-
-
-def _overlap(a: list[tuple[float, float]],
-             b: list[tuple[float, float]], epsilon: float) -> bool:
-    """Separating-axis test for two nondegenerate rotated rectangles."""
-    for polygon in (a, b):
-        for i in (0, 1):
-            x1, y1 = polygon[i]
-            x2, y2 = polygon[i + 1]
-            nx, ny = -(y2 - y1), x2 - x1
-            length = (nx * nx + ny * ny) ** 0.5
-            if length == 0:
-                return False
-            nx, ny = nx / length, ny / length
-            pa = [x * nx + y * ny for x, y in a]
-            pb = [x * nx + y * ny for x, y in b]
-            if min(max(pa), max(pb)) - max(min(pa), min(pb)) <= epsilon:
-                return False
-    return True
-
 
 def _similar(a: Group, b: Group, alignment_tolerance: float,
              size_tolerance: float) -> bool:
@@ -189,104 +165,74 @@ def _bucket_similar(children: list[Group], enabled: bool,
             buckets.append(Similarity([child]))
     return buckets
 
+def rotate(x, y, angle):
+    c, s = math.cos(math.radians(angle)), math.sin(math.radians(angle))
+    return x*c-y*s, x*s+y*c
 
-def build_groups(
-    source: dict[str, Any],
-    *,
-    detect_similarity: bool = True,
-    alignment_tolerance: float = 2.0,
-    size_tolerance: float = 0.05,
-    overlap_epsilon: float = 1e-9,
-) -> list[Group]:
-    """Build the requested tree and return its top-level Group instances.
 
-    Each returned group has the synthetic canvas as parent. Access the canvas
-    with groups[0].parent, or wrap it in a list if a root-inclusive export is
-    preferred. The function expects source, not the full task envelope.
+def region(element):
+    return Region(element["x"]+element["width"]/2,
+                  element["y"]+element["height"]/2,
+                  element["width"], element["height"], element.get("rotation", 0))
 
-    alignment_tolerance: pixels; corresponding edges or centers may differ
-        by at most this amount.
-    size_tolerance: fractional difference relative to the larger dimension;
-        both width AND height must match within this threshold (0.05 = 5%).
-    overlap_epsilon: pixel tolerance used by the rectangle intersection test.
+def contains(parent, child, tolerance=1e-6):
+    p = region(parent)
+    for x, y in _corners(child):
+        lx, ly = rotate(x-p.cx, y-p.cy, -p.angle)
+        if abs(lx) > p.width/2+tolerance or abs(ly) > p.height/2+tolerance:
+            return False
+    return True
 
-    Input is expected to conform to the supplied schema. Geometry, IDs and
-    layer values are checked here; this is not a full JSON Schema validator.
-    The overlap phase is O(n^2); rotated corners are computed once per element.
+
+
+def build_containment_groups(source: dict[str, Any], *,
+                             detect_similarity=True) -> list[Group]:
+    """The existing DFS rule, with FULL rotated containment instead of overlap.
+
+    Uses the original Group/Similarity classes. It does not mutate an existing
+    tree. Explicit group_id is preserved, and checked by the arrangement stage.
+    Out-of-canvas source elements are permitted as canvas-level children.
     """
-    alignment_tolerance = _number(alignment_tolerance, "alignment_tolerance", 0)
-    size_tolerance = _number(size_tolerance, "size_tolerance", 0)
-    overlap_epsilon = _number(overlap_epsilon, "overlap_epsilon", 0)
-    if size_tolerance > 1:
-        raise ValueError("size_tolerance must be between 0 and 1")
     canvas = source["canvas"]
-    W = _number(canvas["width"], "canvas.width", 1)
-    H = _number(canvas["height"], "canvas.height", 1)
-    elements = deepcopy(source["elements"])
-    if not isinstance(elements, list) or not elements:
-        raise ValueError("source.elements must be a nonempty list")
-
-    seen: set[str] = set()
-    for element in elements:
-        element_id = element["id"]
-        if not isinstance(element_id, str) or element_id in seen:
-            raise ValueError(f"Invalid or duplicate element ID: {element_id!r}")
-        seen.add(element_id)
-        for name in ("x", "y", "width", "height"):
-            _number(element[name], f"{element_id}.{name}",
-                    0 if name in ("width", "height") else None)
-        _number(element.get("rotation", 0), f"{element_id}.rotation")
-        z = element.get("z_index", 0)
-        if isinstance(z, bool) or not isinstance(z, int):
-            raise ValueError(f"{element_id}.z_index must be an integer")
-
-    # Sort only layer values that exist: gaps, large values and negative
-    # values require no integer-by-integer search.
-    ordered = sorted(enumerate(elements), key=lambda item: item[1].get("z_index", 0))
-    footprints = {element["id"]: _corners(element) for element in elements}
-    assigned: set[str] = set()
-    root = Group(None, None, (W, H), (W / 2, H / 2), (W / 2, H / 2))
-
-    def populate(parent: Group) -> None:
-        children: list[Group] = []
-        parent_x, parent_y, _, _ = parent.source_bbox
-
-        for source_index, element in ordered:
-            element_id = element["id"]
-            if element_id in assigned:
+    w, h = canvas["width"], canvas["height"]
+    root = Group(None, None, (w,h), (w/2,h/2), (w/2,h/2))
+    ordered = sorted(enumerate(deepcopy(source["elements"])),
+                     key=lambda pair: pair[1].get("z_index", 0))
+    # Reserve explicit containment links before DFS. Otherwise a label inside
+    # the canvas could be claimed before its slightly off-canvas rotated panel.
+    preferred_parent = {}
+    for ci,child in ordered:
+        gid = child.get("group_id")
+        if gid is None: continue
+        possible = [(pi,p) for pi,p in ordered if p["id"] != child["id"]
+                    and p.get("group_id") == gid and p["type"] != "text"
+                    and (p.get("z_index",0),pi) < (child.get("z_index",0),ci)
+                    and contains(p,child)]
+        if possible:
+            preferred_parent[child["id"]] = min(possible,key=lambda pair:
+                (pair[1]["width"]*pair[1]["height"],pair[0]))[1]["id"]
+    assigned = set()
+    def populate(parent, depth=0):
+        if depth > 64:
+            raise ValueError("Hierarchy exceeds 64 levels")
+        children = []
+        px, py, _, _ = parent.source_bbox
+        for index, e in ordered:
+            if e["id"] in assigned:
                 continue
-
-            z = element.get("z_index", 0)
-            if parent.element is not None:
-                if z <= parent.z_index:
-                    continue
-                if not _overlap(footprints[parent.id], footprints[element_id],
-                                overlap_epsilon):
-                    continue
-
-            width, height = float(element["width"]), float(element["height"])
-            cx = float(element["x"]) + width / 2
-            cy = float(element["y"]) + height / 2
-            child = Group(
-                id=element_id,
-                z_index=z,
-                size=(width, height),
-                position=(cx - parent_x, cy - parent_y),
-                absolute_position=(cx, cy),
-                parent=parent,
-                element=element,
-                source_index=source_index,
-            )
-
-            # Claim, attach, then recurse: no second parent can claim it.
-            assigned.add(element_id)
+            if e["id"] in preferred_parent and preferred_parent[e["id"]] != parent.id:
+                continue
+            if parent.element is not None and (
+                (e.get("z_index",0) <= parent.z_index and
+                 preferred_parent.get(e["id"]) != parent.id) or not contains(parent.element,e)
+            ):
+                continue
+            r = region(e)
+            child = Group(e["id"], e.get("z_index",0), (r.width,r.height),
+                          (r.cx-px,r.cy-py), (r.cx,r.cy), parent, e, index)
+            assigned.add(child.id)
             children.append(child)
-            populate(child)
-
-        # Post-order similarity pass: child subtrees are already complete.
-        parent.members = _bucket_similar(
-            children, detect_similarity, alignment_tolerance, size_tolerance
-        )
-
+            populate(child, depth+1)
+        parent.members = _bucket_similar(children, detect_similarity, 2., .05)
     populate(root)
     return root.children
